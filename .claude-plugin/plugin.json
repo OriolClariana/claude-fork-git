@@ -1,6 +1,6 @@
 {
   "name": "fork-git-pane",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "A /git panel with a Fork-style Desktop interface: changes with inline diffs, commit graph, stashes, branch search, AI commit messages",
   "author": {
     "name": "OriolClariana"

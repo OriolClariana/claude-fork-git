@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "fork-git-pane: a Fork-style /git panel for Claude Code Desktop",
-    "version": "0.8.0"
+    "version": "0.8.1"
   },
   "plugins": [
     {
       "name": "fork-git-pane",
       "source": "./",
       "description": "A /git panel with a Fork-style Desktop interface: changes with inline diffs, commit graph, stashes, branch search, AI commit messages",
-      "version": "0.8.0",
+      "version": "0.8.1",
       "author": {
         "name": "OriolClariana"
       },

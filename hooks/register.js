@@ -1587,7 +1587,7 @@ function drawDesktop($, e, ui) {
     })
 
   const changesTab = () => {
-    if (!files.length) return [Svg({ source: cleanSvg(), alt: 'Working tree clean', width: 120, height: 90, isInteractive: true }), Text({ color: 'success', children: ['✓ Working tree clean'] })]
+    if (!files.length) return [Box({ flexDirection: 'column', alignItems: 'center', gap: 'xs', children: [Svg({ source: cleanSvg(), alt: 'Working tree clean', width: 120, height: 90, isInteractive: true }), Text({ color: 'success', children: ['✓ Working tree clean'] })] })]
     const parts = [section('Staged', staged, true), section('Changes', unstaged, false)]
     const canCommit = staged.length > 0 && dmsg.subject.trim().length > 0
     parts.push(
@@ -1661,8 +1661,12 @@ function drawDesktop($, e, ui) {
     const refColor = { head: 'suggestion', local: 'success', remote: 'merged', tag: 'warning', detached: 'suggestion' }
     const rows = history.commits.map((c, i) => {
       const isSel = commitSel?.hash === c.hash
-      const chips = c.refs.slice(0, 3)
-      const chipCells = chips.reduce((n, r) => n + r.name.length + 3, 0)
+      // One short chip per row (head and local first): a row with many refs would wrap. All refs show in the commit detail.
+      const rank = { head: 0, detached: 0, local: 1, tag: 2, remote: 3 }
+      const sorted = [...c.refs].sort((a, b) => (rank[a.kind] ?? 4) - (rank[b.kind] ?? 4))
+      const chips = sorted.slice(0, 1).map((r) => ({ ...r, name: cut(r.name, 18) }))
+      const extra = c.refs.length - chips.length
+      const chipCells = chips.reduce((n, r) => n + r.name.length + 3, 0) + (extra > 0 ? 4 : 0)
       const room = Math.max(12, cols - graphCells - chipCells - 26)
       const line = Box({
         key: 'crow-' + c.hash,
@@ -1672,7 +1676,8 @@ function drawDesktop($, e, ui) {
         ...(isSel ? { backgroundColor: '#4C8DF622' } : {}),
         children: [
           Svg({ source: graphSvg(history.rows[i], history.lanes, c.hash === repo.oid), alt: 'Graph lane for ' + c.short, width: GRAPH_PAD * 2 + (Math.min(history.lanes, MAX_LANES) - 1) * LANE_W, height: ROW_H }),
-          ...chips.map((r) => Text({ color: 'inverseText', backgroundColor: refColor[r.kind] ?? 'subtle', children: [' ' + r.name + ' '] })),
+          ...chips.map((r) => Text({ color: 'inverseText', backgroundColor: refColor[r.kind] ?? 'subtle', wrap: 'truncate-end', children: [' ' + r.name + ' '] })),
+          ...(extra > 0 ? [Text({ dimColor: true, children: ['+' + extra] })] : []),
           Box({
             flexDirection: 'row',
             flexGrow: 1,
@@ -1694,6 +1699,7 @@ function drawDesktop($, e, ui) {
         const opened = d.files.find((f) => f.path === d.fileOpen)
         detail = [
           Text({ dimColor: true, wrap: 'wrap', children: [c.author + ' · ' + c.when + ' · ' + c.short + (c.parents.length > 1 ? ' · merge' : '')] }),
+          ...(c.refs.length ? [Box({ flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: c.refs.map((r) => Text({ color: 'inverseText', backgroundColor: refColor[r.kind] ?? 'subtle', children: [' ' + r.name + ' '] })) })] : []),
           ...(c.body ? [Text({ wrap: 'wrap', children: [c.body] })] : []),
           Button({ key: 'copy-commit-' + c.hash, label: 'Copy hash', plain: true, onPress: (p) => { $.ui.copy({ text: c.hash, surface: p.surface }); $.ui.toast('Copied ' + c.short) } }),
           Text({ weight: 'semibold', children: [d.files.length + ' file' + (d.files.length === 1 ? '' : 's') + ' changed'] }),
@@ -1723,7 +1729,8 @@ function drawDesktop($, e, ui) {
     if (history.commits.length >= history.limit) {
       rows.push(Button({ key: 'history-more', label: 'Load ' + HISTORY_STEP + ' more', plain: true, dimColor: true, onPress: () => { history.limit += HISTORY_STEP; history.key = ''; loadHistory($).catch(() => {}) } }))
     }
-    return rows
+    // No gap between rows: the graph lines then meet from one row to the next
+    return [Box({ flexDirection: 'column', children: rows })]
   }
 
   // --- Stashes tab ---
@@ -1768,6 +1775,7 @@ function drawDesktop($, e, ui) {
       const isDirty = files.some((f) => subPath(f.path) === m.path)
       const label = m.state === '-' ? 'not initialized' : m.state === 'U' ? 'conflict' : isDirty ? 'changed' : m.state === '+' ? 'other commit checked out' : 'up to date'
       const color = m.state === 'U' ? 'error' : m.state === '-' ? undefined : isDirty || m.state === '+' ? 'warning' : 'success'
+      const base = m.path.split('/').pop()
       return Box({
         key: 'sub-' + m.path,
         flexDirection: 'row',
@@ -1779,13 +1787,18 @@ function drawDesktop($, e, ui) {
             flexGrow: 1,
             flexShrink: 1,
             children: [
-              m.state === '-'
-                ? Text({ wrap: 'truncate-end', children: [m.path] })
-                : Button({ key: 'open-sub-' + m.path, label: cut(m.path, Math.max(10, cols - 28)), plain: true, hover: { color: 'suggestion' }, onPress: () => enterSub(m.path) }),
-              Text({ dimColor: true, wrap: 'truncate-end', children: [m.sha.slice(0, 7) + (m.describe ? ' · ' + m.describe : '')] }),
+              Text({ weight: 'semibold', wrap: 'truncate-end', children: [base] }),
+              Box({
+                flexDirection: 'row',
+                gap: 'sm',
+                children: [
+                  Text({ color, dimColor: !color, children: ['●'] }),
+                  Text({ color, dimColor: !color, children: [label] }),
+                  Text({ dimColor: true, wrap: 'truncate-end', children: [m.sha.slice(0, 7) + (m.describe ? ' · ' + m.describe : '')] }),
+                ],
+              }),
             ],
           }),
-          Text({ color, dimColor: !color, children: [label] }),
           ...(m.state === '-' ? [] : [Button({ key: 'enter-sub-' + m.path, label: '›', onPress: () => enterSub(m.path) })]),
         ],
       })
