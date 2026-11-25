@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { parseStatus, parseStashes, parseMessage, cleanTitle, firstChangedLine, editorFor, editorUrl, discardCommands, parseBranches, matchBranches, checkoutArgs, parseLog, parseRefs, parseSubmodules, layoutGraph, graphSvg, badgeSvg, statusSvg, cleanSvg, splitDiff, trimHunks } from '../hooks/register.js'
+import { parseStatus, parseStashes, parseMessage, cleanTitle, firstChangedLine, editorFor, editorUrl, discardCommands, parseBranches, matchBranches, checkoutArgs, parseLog, parseRefs, parseSubmodules, layoutGraph, graphSvg, badgeSvg, lenBand, statusSvg, cleanSvg, splitDiff, trimHunks } from '../hooks/register.js'
 
 const PANE = {
   plugin: 'fork-git-pane',
@@ -637,4 +637,93 @@ test('effects: status band glows when dirty, spins when busy, clean state pulses
   expect(dirty).not.toContain('class="spin"')
   expect(statusSvg(400, { staged: 0, changes: 0, ahead: 0, behind: 0, busy: true })).toContain('class="spin"')
   expect(cleanSvg()).toContain('class="live"')
+})
+
+test('settings pane toggles an option and the header follows', async ($, on) => {
+  const calls: string[][] = []
+  baseStubs(on, calls)
+  await $.command.run({ command: 'git', args: '' })
+  const main = await $.ui.mount({ ...PANE, surface: 'desktop' } as any)
+  expect(await main.find({ type: 'Text', text: 'Behind' })).toBeDefined()
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', requestId: 'git-mod-settings' } as any)
+  expect(await ui.find({ type: 'Text', text: 'Glow' })).toBeDefined()
+  await ui.press({ key: 'opt-showTiles' })
+  await main.redraw()
+  expect(await main.find({ type: 'Text', text: 'Behind' })).toBeUndefined()
+})
+
+test('summary length bands', () => {
+  expect([0, 1, 50, 51, 72, 73].map(lenBand)).toEqual([0, 1, 1, 2, 2, 3])
+})
+
+test('desktop: diverged pull offers merge or rebase and undoes a failed one', async ($, on) => {
+  const calls: string[][] = []
+  const status = STATUS.replace('+2 -0', '+2 -3')
+  let n = 0
+  baseStubs(on, calls, {
+    status: () => ({ value: { exitCode: 0, stdout: status, stderr: '' } }),
+    pull: (args: string[]) => {
+      n++
+      return n === 1 ? { value: { exitCode: 1, stdout: '', stderr: 'fatal: Not possible to fast-forward, aborting.' } } : { value: { exitCode: 1, stdout: '', stderr: 'CONFLICT (content): Merge conflict in a.txt' } }
+    },
+  })
+  await $.command.run({ command: 'git', args: '' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' } as any)
+  await ui.press({ key: 'pull' })
+  expect(await ui.find({ key: 'pull-rebase' } as any)).toBeDefined()
+  await ui.press({ key: 'pull-rebase' })
+  const subs = calls.map((c) => c.slice(5).join(' '))
+  expect(subs).toContain('pull --rebase')
+  expect(subs).toContain('rebase --abort')
+  expect(await ui.find({ type: 'Text', text: /failed and was undone/ })).toBeDefined()
+})
+
+test('desktop: new branch from the search box, delete asks twice', async ($, on) => {
+  const calls: string[][] = []
+  branchStubs(on, calls)
+  await $.command.run({ command: 'git', args: '' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' } as any)
+  await ui.press({ key: 'checkout' })
+  await ui.input({ key: 'branch-query', text: 'feature/new-thing', kind: 'change' })
+  await ui.press({ key: 'branch-create' })
+  expect(calls.some((c) => c.slice(5).join(' ') === 'checkout -b feature/new-thing')).toBe(true)
+  await ui.press({ key: 'checkout' })
+  await ui.press({ key: 'del-refs/heads/main' })
+  expect(calls.some((c) => c.slice(5).join(' ') === 'branch -d main')).toBe(false)
+  await ui.press({ key: 'del-ok-refs/heads/main' })
+  expect(calls.some((c) => c.slice(5).join(' ') === 'branch -d main')).toBe(true)
+})
+
+test('desktop: History search filters loaded commits and the scope button limits to this branch', async ($, on) => {
+  const calls: string[][] = []
+  const LOG = ['a1\x1f\x1fAda\x1f1 hour ago\x1f\x1ffix login\x1f\x1e', 'b2\x1fa1\x1fBob\x1f2 hours ago\x1f\x1fadd search\x1f\x1e'].join('\n')
+  baseStubs(on, calls, { log: (args: string[]) => ({ value: { exitCode: 0, stdout: args[1] === '--branches' || args[1] === 'HEAD' ? LOG : 'x\n', stderr: '' } }) })
+  await $.command.run({ command: 'git', args: '' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' } as any)
+  await ui.press({ key: 'tab-history' })
+  await ui.redraw()
+  expect(await ui.find({ key: 'commit-a1' } as any)).toBeDefined()
+  await ui.input({ key: 'history-query', text: 'bob', kind: 'change' })
+  expect(await ui.find({ key: 'commit-a1' } as any)).toBeUndefined()
+  expect(await ui.find({ key: 'commit-b2' } as any)).toBeDefined()
+  await ui.press({ key: 'history-scope' })
+  await ui.redraw()
+  const logs = calls.filter((c) => c.slice(5)[0] === 'log' && c.includes('--decorate=full'))
+  expect(logs[logs.length - 1].includes('--branches')).toBe(false)
+})
+
+test('desktop: sections fold and the folder tree groups files', async ($, on) => {
+  const calls: string[][] = []
+  baseStubs(on, calls)
+  await $.command.run({ command: 'git', args: '' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' } as any)
+  expect(await ui.find({ key: 'unstage-src/app.ts' } as any)).toBeDefined()
+  await ui.press({ key: 'fold-Staged' })
+  expect(await ui.find({ key: 'unstage-src/app.ts' } as any)).toBeUndefined()
+  await ui.press({ key: 'fold-Staged' })
+  const settings = await $.ui.mount({ ...PANE, surface: 'desktop', requestId: 'git-mod-settings' } as any)
+  await settings.press({ key: 'opt-fileTree' })
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: '📁 src' })).toBeDefined()
+  expect(await ui.find({ key: 'unstage-src/app.ts' } as any)).toBeDefined()
 })

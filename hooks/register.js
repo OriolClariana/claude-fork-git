@@ -6,9 +6,11 @@
 // Helpers that take $ are top-level functions: static analysis refuses $
 // passed to nested or imported functions.
 
+import { atom, read, update } from 'claude-code'
+
 const PANE = 'git-mod'
+const SETTINGS_PANE = 'git-mod-settings'
 const MODEL = 'haiku' // model for commit messages and stash titles
-const POLL_MS = 3000 // refresh interval while the panel is open
 const BASE_BRANCHES = ['develop', 'dev', 'development', 'main', 'master']
 const WATCHED_TOOLS = ['Bash', 'PowerShell', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit']
 const DOUBLE_PRESS_MS = 500 // two presses on one file within this open it
@@ -72,6 +74,11 @@ let focused = { key: '', at: 0 } // the pane element holding the focus ring
 let branches = [] // { name, ref, local, remote, when, order, key, full, base }, newest commit first
 let branchesError = ''
 let branchesLoading = null // the running load, so presses share it
+const folded = new Set() // 'Staged' / 'Changes' sections the person folded
+let histQuery = '' // History search text, applied to the loaded commits
+let histScope = 'all' // 'all' draws every branch and tag, 'head' only the current branch
+let confirmBranchDel = '' // ref of the branch whose delete awaits a second press
+let divergeAsk = false // the last pull found diverged branches: offer merge or rebase
 let branchSearch = null // { query } while the branch search is open
 let matchCache = { list: null, query: '', pool: [] } // the last query's matches, narrowed as it grows
 
@@ -291,6 +298,143 @@ function lastLines(text, n) {
   return text.trim().split('\n').filter(Boolean).slice(-n).join('\n')
 }
 
+// ---------- settings ----------
+// Every option, in the order the settings pane draws it. Choices are cycled by pressing the button.
+const pick = (list, fmt = String) => list.map((v) => ({ label: fmt(v), value: v }))
+export const SPEC = [
+  { group: 'Visual', key: 'glowEffect', label: 'Glow', desc: 'Soft glow on the status orb, the tiles and the clean-state rings.', def: true },
+  { group: 'Visual', key: 'pulseEffect', label: 'Pulse', desc: 'The glow and the HEAD dot slowly pulse. Always off when the system asks for reduced motion.', def: true },
+  { group: 'Visual', key: 'showOrb', label: 'Status orb', desc: 'The colored dot before the branch name.', def: true },
+  { group: 'Visual', key: 'showTiles', label: 'Summary tiles', desc: 'Staged, Changes, Ahead and Behind under the header.', def: true },
+  { group: 'Visual', key: 'fileTree', label: 'Folder tree', desc: 'Group the files by folder in Staged and Changes.', def: false },
+  { group: 'Visual', key: 'summaryCounter', label: 'Summary counter', desc: 'Show the length of the commit summary against 50 and 72 characters.', def: true },
+  { group: 'Visual', key: 'summaryRows', label: 'Summary height', desc: 'Lines of the Summary box.', def: 3, choices: pick([1, 2, 3, 5]) },
+  { group: 'Visual', key: 'bodyRows', label: 'Body height', desc: 'Lines of the Body box.', def: 10, choices: pick([4, 6, 10, 15, 20]) },
+  { group: 'Behavior', key: 'autoOpenPane', label: 'Open on start', desc: 'Open the panel by itself when the session folder is a git repository.', def: true },
+  { group: 'Behavior', key: 'defaultTab', label: 'First tab', desc: 'The tab shown when the panel opens.', def: 0, choices: [{ label: 'Changes', value: 0 }, { label: 'History', value: 1 }] },
+  { group: 'Behavior', key: 'pollSeconds', label: 'Refresh every', desc: 'How often the panel reads the repository while open. Local only.', def: 3, choices: pick([1, 3, 5, 10, 30], (v) => v + 's') },
+  { group: 'Behavior', key: 'autoFetchMinutes', label: 'Auto fetch', desc: 'Fetch all remotes in the background every N minutes. Needs working credentials.', def: 0, choices: pick([0, 1, 5, 10, 15], (v) => (v ? v + ' min' : 'Off')) },
+  { group: 'History and diffs', key: 'historyPageSize', label: 'Commits per page', desc: 'How many commits History loads at a time.', def: 100, choices: pick([50, 100, 200, 500]) },
+  { group: 'History and diffs', key: 'diffMaxChars', label: 'Diff size limit', desc: 'Characters of one diff drawn at once. Bigger diffs show the first hunks.', def: 30000, choices: pick([10000, 30000, 60000, 90000], (v) => v / 1000 + 'k') },
+  { group: 'Alerts', key: 'toastOnDone', label: 'Toast when done', desc: 'A toast when Fetch, Pull, Push, Commit or Stash finish.', def: true },
+]
+const cfgDefaults = () => Object.fromEntries(SPEC.map((r) => [r.key, r.def]))
+let cfg = cfgDefaults()
+const settingsAtom = atom({ plugin: 'fork-git-pane', key: 'settings' }, {}, { shape: 'settings-1' })
+
+async function loadCfg($) {
+  try {
+    cfg = { ...cfgDefaults(), ...(await read($, settingsAtom)) }
+  } catch {
+    cfg = cfgDefaults()
+  }
+}
+
+async function setOpt($, key, value) {
+  cfg = { ...cfg, [key]: value }
+  if (key === 'pollSeconds') startPoll($)
+  if (key === 'historyPageSize') {
+    history.limit = value
+    history.key = ''
+  }
+  $.ui.invalidate('ui.render') // draw first: saving can take a moment
+  await update($, settingsAtom, (o) => ({ ...o, [key]: value }))
+}
+
+async function resetOpts($) {
+  cfg = cfgDefaults()
+  await update($, settingsAtom, () => ({}))
+  startPoll($)
+  history.limit = cfg.historyPageSize
+  history.key = ''
+  $.ui.invalidate('ui.render')
+}
+
+let pollTimer
+let lastAutoFetch = 0
+function startPoll($) {
+  pollTimer?.cancel?.()
+  pollTimer = $.clock.every(Math.max(1, cfg.pollSeconds) * 1000, async () => {
+    saveDrafts($).catch(() => {})
+    if (!paneOpen || busy) return
+    refresh($).catch(() => {})
+    if (cfg.autoFetchMinutes > 0) {
+      const now = await $.clock.now()
+      if (now - lastAutoFetch >= cfg.autoFetchMinutes * 60000) {
+        lastAutoFetch = now
+        autoFetch($).catch(() => {})
+      }
+    }
+  })
+}
+
+// Silent fetch: no notice and no busy label, so it never gets in the way of a press
+async function autoFetch($) {
+  const r = await gitRoot($, ['fetch', '--all', '--prune'], { timeoutMs: 180000 })
+  if (!r.ok) return
+  history.key = ''
+  lastSig = ''
+  await refresh($)
+}
+
+function drawSettings($, e) {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const groups = [...new Set(SPEC.map((r) => r.group))]
+  const control = (r) => {
+    const v = cfg[r.key]
+    // Read cfg again at press time: a quick second press must not use the value drawn before the first
+    // A Button takes no color, so the state is a green or red Text beside the button
+    if (typeof r.def === 'boolean') {
+      return Box({
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 'sm',
+        children: [
+          Text({ color: v ? 'success' : 'error', weight: 'semibold', children: [v ? '● On' : '○ Off'] }),
+          Button({ key: 'opt-' + r.key, label: v ? 'Turn off' : 'Turn on', onPress: () => setOpt($, r.key, !cfg[r.key]) }),
+        ],
+      })
+    }
+    const at = Math.max(0, r.choices.findIndex((c) => c.value === v))
+    return Button({
+      key: 'opt-' + r.key,
+      label: (r.choices[at]?.label ?? String(v)) + ' ▾',
+      onPress: () => setOpt($, r.key, r.choices[(Math.max(0, r.choices.findIndex((c) => c.value === cfg[r.key])) + 1) % r.choices.length].value),
+    })
+  }
+  return Box({
+    flexDirection: 'column',
+    gap: 'sm',
+    children: [
+      Box({
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        paddingX: 'sm',
+        borderStyle: 'round',
+        borderColor: 'suggestion',
+        children: [
+          Text({ weight: 'semibold', color: 'suggestion', children: ['⚙ Settings · apply instantly'] }),
+          Button({ key: 'opt-reset', label: 'Reset', plain: true, dimColor: true, onPress: () => resetOpts($) }),
+        ],
+      }),
+      ...groups.flatMap((g) => [
+        Text({ weight: 'semibold', color: 'suggestion', children: [g] }),
+        ...SPEC.filter((r) => r.group === g).map((r) =>
+          Box({
+            key: 'row-' + r.key,
+            flexDirection: 'column',
+            children: [
+              Box({ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 'sm', children: [Text({ weight: 'semibold', wrap: 'truncate-end', children: [r.label] }), control(r)] }),
+              Text({ dimColor: true, wrap: 'wrap', children: [r.desc] }),
+            ],
+          }),
+        ),
+      ]),
+    ],
+  })
+}
+
 // Runs one action at a time; shows a working line while it runs
 async function runAction($, label, work) {
   if (busy) {
@@ -298,9 +442,11 @@ async function runAction($, label, work) {
     return
   }
   busy = label
+  const before = notice
   $.ui.invalidate('ui.render')
   try {
     await work()
+    if (cfg.toastOnDone && notice && notice !== before && notice.tone === 'ok') $.ui.toast('✓ ' + notice.text.split('\n')[0])
   } catch (err) {
     setNotice($, 'error', label + ' failed: ' + (err?.message ?? err))
   } finally {
@@ -457,7 +603,21 @@ async function push($) {
 }
 
 // Fast-forward only: never creates a merge commit or rewrites local commits
+// Pull for diverged branches. A conflict is undone at once so the repository is never left half-merged.
+async function pullWith($, mode) {
+  divergeAsk = false
+  const rebase = mode === 'rebase'
+  const r = await gitRoot($, rebase ? ['pull', '--rebase'] : ['pull', '--no-rebase', '--no-edit'], { timeoutMs: 180000 })
+  if (!r.ok) {
+    await gitRoot($, rebase ? ['rebase', '--abort'] : ['merge', '--abort'])
+    setNotice($, 'error', (rebase ? 'Rebase' : 'Merge') + ' pull failed and was undone:\n' + lastLines(r.err || r.out, 6) + '\nResolve it in your terminal.')
+    return
+  }
+  setNotice($, 'ok', 'Pulled with ' + (rebase ? 'rebase' : 'merge') + ' from ' + repo.upstream)
+}
+
 async function pull($) {
+  divergeAsk = false
   if (repo.isDetached) {
     setNotice($, 'error', 'HEAD is detached. Check out a branch before pulling.')
     return
@@ -471,8 +631,9 @@ async function pull($) {
   if (!r.ok) {
     const text = r.err || r.out
     const hint = /not possible to fast-forward|diverg/i.test(text)
-      ? '\nThe branches have diverged. Run git pull --rebase or git pull --no-rebase yourself.'
+      ? '\nThe branches have diverged: choose how to combine them.'
       : ''
+    divergeAsk = hint !== ''
     setNotice($, 'error', 'Pull failed:\n' + lastLines(text, 6) + hint)
     return
   }
@@ -700,7 +861,7 @@ async function focusBranchQuery($) {
     const r = await $.ui.focus({ requestId: PANE, key: 'branch-query' })
     if (!r?.deny) return
     // The pane does not hold the keyboard (the press came from elsewhere): take it
-    await $.ui.open({ id: PANE, title: 'Git', focus: true, closeOnEscape: true, columns: await paneColumns($) })
+    await $.ui.open({ id: PANE, title: '📂 Git', focus: true, closeOnEscape: true, columns: await paneColumns($) })
     await $.ui.focus({ requestId: PANE, key: 'branch-query' })
   } catch (err) {
     $.ui.log('git-mod: could not focus the branch search: ' + (err?.message ?? err), { to: 'debug' })
@@ -722,6 +883,39 @@ async function checkoutBranch($, b) {
   branchSearch = null
   setNotice($, 'ok', b.remote ? 'Checked out ' + b.local + ', tracking ' + b.name : 'Checked out ' + b.name)
   // A remote branch now has a local one: list it as local next time
+  loadBranches($).catch(() => {})
+}
+
+// A name git accepts as a branch (no spaces, no "..", not ending in .lock, and so on)
+async function validBranchName($, name) {
+  return name !== '' && (await gitRoot($, ['check-ref-format', '--branch', name])).ok
+}
+
+async function createBranch($, name) {
+  if (!(await validBranchName($, name))) return setNotice($, 'error', '"' + name + '" is not a valid branch name.')
+  const r = await gitRoot($, ['checkout', '-b', name], { timeoutMs: 60000 })
+  if (!r.ok) return setNotice($, 'error', 'Could not create ' + name + ':\n' + lastLines(r.err || r.out, 6))
+  branchSearch = null
+  setNotice($, 'ok', 'Created and checked out ' + name)
+  loadBranches($).catch(() => {})
+}
+
+async function renameBranch($, name) {
+  if (repo.isDetached) return setNotice($, 'error', 'HEAD is detached: there is no branch to rename.')
+  if (!(await validBranchName($, name))) return setNotice($, 'error', '"' + name + '" is not a valid branch name.')
+  const r = await gitRoot($, ['branch', '-m', name], { timeoutMs: 60000 })
+  if (!r.ok) return setNotice($, 'error', 'Could not rename to ' + name + ':\n' + lastLines(r.err || r.out, 6))
+  branchSearch = null
+  setNotice($, 'ok', 'Renamed to ' + name + '. Its upstream, if any, still has the old name.')
+  loadBranches($).catch(() => {})
+}
+
+// `-d` only deletes a branch that is fully merged: git refuses otherwise and nothing is lost
+async function deleteBranch($, b) {
+  confirmBranchDel = ''
+  const r = await gitRoot($, ['branch', '-d', b.name], { timeoutMs: 60000 })
+  if (!r.ok) return setNotice($, 'error', b.name + ' was not deleted:\n' + lastLines(r.err || r.out, 6) + '\nIf you are sure, run git branch -D ' + b.name + ' yourself.')
+  setNotice($, 'ok', 'Deleted ' + b.name)
   loadBranches($).catch(() => {})
 }
 
@@ -866,8 +1060,6 @@ const LANE_W = 14
 const GRAPH_PAD = 10
 const ROW_H = 28
 const MAX_LANES = 8
-const HISTORY_STEP = 100
-const DIFF_MAX = 30000 // characters of one diff drawn at once (a drawing holds 100000 in all)
 const BADGES = {
   added: { letter: 'A', fill: '#2EA043' },
   untracked: { letter: '?', fill: '#6E7781' },
@@ -983,7 +1175,7 @@ export function graphSvg(row, lanes, isHead) {
   const dot = isHead
     ? '<circle class="live" cx="' + cx + '" cy="' + mid + '" r="5.5" fill="none" stroke="' + color(row.col) + '" stroke-width="2"/><circle cx="' + cx + '" cy="' + mid + '" r="2.5" fill="' + color(row.col) + '"/>'
     : '<circle cx="' + cx + '" cy="' + mid + '" r="4.5" fill="' + color(row.col) + '"/>'
-  return '<svg ' + SVG_NS + ' width="' + width + '" height="' + ROW_H + '" viewBox="0 0 ' + width + ' ' + ROW_H + '">' + (isHead ? FX_CSS : '') + '<g fill="none" stroke-width="2" stroke-linecap="round">' + s + '</g>' + dot + '</svg>'
+  return '<svg ' + SVG_NS + ' width="' + width + '" height="' + ROW_H + '" viewBox="0 0 ' + width + ' ' + ROW_H + '">' + (isHead ? fxCss() : '') + '<g fill="none" stroke-width="2" stroke-linecap="round">' + s + '</g>' + dot + '</svg>'
 }
 
 
@@ -995,6 +1187,8 @@ const FX_CSS =
   '.spin{transform-box:fill-box;transform-origin:center;animation:r 1s linear infinite}@keyframes r{to{transform:rotate(360deg)}}' +
   '@media (prefers-reduced-motion: reduce){.live,.spin{animation:none}}</style>' +
   '<defs><filter id="g" x="-50%" y="-80%" width="200%" height="260%"><feGaussianBlur stdDeviation="2.5"/></filter></defs>'
+const fxCss = () =>
+  FX_CSS + (cfg.pulseEffect === false ? '<style>.live{animation:none}</style>' : '') + (cfg.glowEffect === false ? '<style>[filter]{display:none}</style>' : '')
 const FX_FONT = "font-family=\"-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif\""
 const fxEsc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
 
@@ -1031,12 +1225,12 @@ export function orbSvg(color, busy) {
   const o = busy
     ? '<circle cx="10" cy="10" r="7" class="rk" stroke-width="2.5"/><circle class="spin" cx="10" cy="10" r="7" fill="none" stroke="' + color + '" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="11 33"/>'
     : '<circle class="live" cx="10" cy="10" r="6" fill="' + color + '" filter="url(#g)"/><circle cx="10" cy="10" r="4.5" fill="' + color + '"/>'
-  return '<svg ' + SVG_NS + ' width="20" height="20" viewBox="0 0 20 20">' + FX_CSS + o + '</svg>'
+  return '<svg ' + SVG_NS + ' width="20" height="20" viewBox="0 0 20 20">' + fxCss() + o + '</svg>'
 }
 
 // Empty state: breathing rings around a check.
 export function cleanSvg() {
-  return '<svg ' + SVG_NS + ' width="120" height="90" viewBox="0 0 120 90">' + FX_CSS +
+  return '<svg ' + SVG_NS + ' width="120" height="90" viewBox="0 0 120 90">' + fxCss() +
     '<circle class="live" cx="60" cy="45" r="30" fill="none" stroke="#40C057" stroke-width="2" filter="url(#g)"/>' +
     '<circle class="live" cx="60" cy="45" r="22" fill="none" stroke="#40C057" stroke-width="2" style="animation-delay:-.6s"/>' +
     '<path d="M50 46l7 7 13-15" fill="none" stroke="#40C057" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>'
@@ -1091,7 +1285,7 @@ function diffElements(ui, f) {
   const { Text, Code } = ui
   if (f.isBinary) return [Text({ dimColor: true, children: ['Binary file'] })]
   if (!f.hunks.trim()) return [Text({ dimColor: true, children: ['No content changes (mode or rename only).'] })]
-  const t = trimHunks(f.hunks, DIFF_MAX)
+  const t = trimHunks(f.hunks, cfg.diffMaxChars)
   const out = []
   if (t.text) out.push(Code({ source: t.text, format: 'diff', path: f.path, wrap: 'wrap' }))
   if (t.hidden) {
@@ -1117,7 +1311,7 @@ export function parseSubmodules(out) {
 function resetRepoView() {
   diffSel = null
   commitSel = null
-  history = { key: '', commits: [], rows: [], lanes: 1, limit: HISTORY_STEP, loading: false, error: '' }
+  history = { key: '', commits: [], rows: [], lanes: 1, limit: cfg.historyPageSize, loading: false, error: '' }
   branches = []
   branchSearch = null
   matchCache = { list: null, query: '', pool: [] }
@@ -1126,21 +1320,40 @@ function resetRepoView() {
   dmsg = { subject: '', body: '' }
   confirmDiscard = ''
   confirmDrop = ''
+  confirmBranchDel = ''
+  divergeAsk = false
+  histQuery = ''
   notice = null
   view = { tab: 'changes' }
   lastSig = ''
 }
 
 // Moves the whole panel into a submodule (depth > 0 of the stack) or back out
+const drafts = {} // commit message typed per repository path, kept while navigating and across restarts
+const draftsAtom = atom({ plugin: 'fork-git-pane', key: 'drafts' }, {}, { shape: 'drafts-1' })
+let savedDrafts = ''
+const currentRoot = () => navStack[navStack.length - 1] ?? topRoot
+
+async function saveDrafts($) {
+  drafts[currentRoot()] = dmsg
+  const live = Object.fromEntries(Object.entries(drafts).filter(([, d]) => d.subject || d.body))
+  const sig = JSON.stringify(live)
+  if (sig === savedDrafts) return
+  savedDrafts = sig
+  await update($, draftsAtom, () => live)
+}
+
 async function navigate($, stack) {
+  drafts[currentRoot()] = dmsg
   navStack = stack
   resetRepoView()
+  dmsg = drafts[currentRoot()] ?? dmsg
   await refresh($)
   $.ui.invalidate('ui.render')
 }
 
 function historyKey() {
-  return repo && !repo.error ? repo.oid + '|' + repo.branch + '|' + history.limit : ''
+  return repo && !repo.error ? repo.oid + '|' + repo.branch + '|' + history.limit + '|' + histScope : ''
 }
 
 async function loadHistory($) {
@@ -1154,7 +1367,7 @@ async function loadHistory($) {
   try {
     const key = historyKey()
     const r = await gitRoot($, [
-      'log', '--branches', '--remotes', '--tags', 'HEAD', '--date-order', '--decorate=full', '-n', String(history.limit),
+      'log', ...(histScope === 'all' ? ['--branches', '--remotes', '--tags'] : []), 'HEAD', '--date-order', '--decorate=full', '-n', String(history.limit),
       '--format=%H%x1f%P%x1f%an%x1f%ar%x1f%D%x1f%s%x1f%b%x1e',
     ], { timeoutMs: 30000 })
     if (!r.ok) {
@@ -1339,16 +1552,16 @@ function drawDesktop($, e, ui) {
         flexDirection: 'row',
         alignItems: 'center',
         gap: 'sm',
-        children: [Svg({ source: orbSvg(statusColor({ staged: staged.length, changes: unstaged.length, behind: repo.behind, busy: !!busy }), !!busy), alt: 'Status', width: 20, height: 20, isInteractive: true }), icon(BRANCH_SVG, 'Branch'), Text({ weight: 'semibold', size: 'heading', wrap: 'truncate-end', children: [branchName] })],
+        children: [...(cfg.showOrb ? [Svg({ source: orbSvg(statusColor({ staged: staged.length, changes: unstaged.length, behind: repo.behind, busy: !!busy }), !!busy), alt: 'Status', width: 20, height: 20, isInteractive: true })] : []), icon(BRANCH_SVG, 'Branch'), Text({ weight: 'semibold', size: 'heading', wrap: 'truncate-end', children: [branchName] })],
       }),
       Box({ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'sm', children: meta }),
-      Box({
+      ...(!cfg.showTiles ? [] : [Box({
         flexDirection: 'row',
         gap: 'sm',
         children: [['Staged', staged.length, 'success'], ['Changes', unstaged.length, 'warning'], ['Ahead', repo.ahead, 'suggestion'], ['Behind', repo.behind, 'error']].map(([k, v, c]) =>
           Box({ flexGrow: 1, flexDirection: 'column', paddingX: 'sm', borderStyle: 'round', borderColor: v ? c : 'subtle', children: [Text({ dimColor: true, children: [k] }), Text({ weight: 'semibold', color: v ? c : undefined, dimColor: !v, children: [String(v)] })] }),
         ),
-      }),
+      })]),
     ],
   })
 
@@ -1380,6 +1593,7 @@ function drawDesktop($, e, ui) {
           Button({ key: 'checkout', label: (branchSearch ? '▾ ' : '⎇ ') + 'Branch', onPress: () => toggleBranchSearch($) }),
           Button({ key: 'stash', label: '⤓ Stash', dimColor: !files.length, onPress: () => runAction($, 'Stashing (writing a title)', () => stash($)) }),
           Button({ key: 'refresh', label: '↻', dimColor: true, onPress: () => runAction($, 'Refreshing', async () => {}) }),
+          Button({ key: 'settings', label: '⚙', dimColor: true, onPress: () => $.ui.open({ id: SETTINGS_PANE, title: '⚙ Git settings', focus: true, closeOnEscape: true }) }),
           Button({ key: 'close', label: '✕', dimColor: true, onPress: () => closePane($) }),
         ],
       }),
@@ -1404,6 +1618,8 @@ function drawDesktop($, e, ui) {
     const matches = searchMatches()
     const shown = matches.slice(0, MAX_MATCHES)
     const checkout = (b) => runAction($, 'Checking out ' + b.name, () => checkoutBranch($, b))
+    const typed = bs.query.trim()
+    const newName = typed && !branches.some((b) => !b.remote && b.name === typed) && typed !== repo.branch ? typed : ''
     const status = branchesError
       ? Text({ color: 'error', wrap: 'wrap', children: [branchesError] })
       : !branches.length && branchesLoading
@@ -1445,10 +1661,26 @@ function drawDesktop($, e, ui) {
               children: [
                 Button({ key: 'co-' + b.ref, label: cut(b.name, Math.max(12, cols - 24)), plain: true, hover: { color: 'suggestion' }, onPress: () => checkout(b) }),
                 Text({ dimColor: true, wrap: 'truncate-end', children: [(b.remote ? 'remote · ' : '') + b.when] }),
+                ...(b.remote
+                  ? []
+                  : confirmBranchDel === b.ref
+                    ? [Button({ key: 'del-ok-' + b.ref, label: 'Confirm delete', onPress: () => runAction($, 'Deleting ' + b.name, () => deleteBranch($, b)) }), Button({ key: 'del-no-' + b.ref, label: 'Keep', dimColor: true, onPress: () => { confirmBranchDel = ''; redraw() } })]
+                    : [Button({ key: 'del-' + b.ref, label: '🗑', dimColor: true, onPress: () => { confirmBranchDel = b.ref; redraw() } })]),
               ],
             }),
           ),
           ...(status ? [status] : []),
+          ...(newName
+            ? [Box({
+                flexDirection: 'row',
+                flexWrap: 'wrap',
+                gap: 'sm',
+                children: [
+                  Button({ key: 'branch-create', label: '＋ Create ' + cut(newName, 30), onPress: () => runAction($, 'Creating ' + newName, () => createBranch($, newName)) }),
+                  ...(repo.isDetached ? [] : [Button({ key: 'branch-rename', label: '✎ Rename current to ' + cut(newName, 24), onPress: () => runAction($, 'Renaming ' + repo.branch, () => renameBranch($, newName)) })]),
+                ],
+              })]
+            : []),
           Button({ key: 'close-search', label: 'Close', plain: true, dimColor: true, onPress: () => toggleBranchSearch($) }),
         ],
       }),
@@ -1474,6 +1706,12 @@ function drawDesktop($, e, ui) {
             flexDirection: 'row',
             gap: 'sm',
             children: [
+              ...(divergeAsk && repo.ahead && repo.behind
+                ? [
+                    Button({ key: 'pull-merge', label: '⑂ Pull with merge', onPress: () => runAction($, 'Pulling with merge', () => pullWith($, 'merge')) }),
+                    Button({ key: 'pull-rebase', label: '⤒ Pull with rebase', onPress: () => runAction($, 'Pulling with rebase', () => pullWith($, 'rebase')) }),
+                  ]
+                : []),
               ...(notice.hash
                 ? [Button({ key: 'copy-hash', label: 'Copy hash', plain: true, onPress: (p) => { $.ui.copy({ text: notice.hash, surface: p.surface }); $.ui.toast('Copied ' + notice.hash.slice(0, 10)) } })]
                 : []),
@@ -1491,7 +1729,7 @@ function drawDesktop($, e, ui) {
   const subPath = (path) => path.replace(/\/$/, '')
   const isSub = (path) => subs.some((m) => m.path === subPath(path) && m.state !== '-')
   const enterSub = (path) => navigate($, [...navStack, repo.root + '/' + subPath(path)])
-  const fileRow = (f, isStagedList) => {
+  const fileRow = (f, isStagedList, hideDir = false) => {
     const code = isStagedList ? f.x : f.isUntracked ? '?' : f.isConflict ? 'U' : f.y
     const kind = f.isUntracked && !isStagedList ? 'untracked' : kindOf(code)
     const [dir, base] = splitPath(f.path.replace(/\/$/, ''))
@@ -1531,7 +1769,7 @@ function drawDesktop($, e, ui) {
               flexShrink: 1,
               children: [
                 Button({ key: openKey, label: cut(name, room), plain: true, hover: { color: 'suggestion' }, onPress: () => showFileDiff($, f, isStagedList) }),
-                Text({ dimColor: true, wrap: 'truncate-start', children: [dir.replace(/\/$/, '')] }),
+                ...(hideDir ? [] : [Text({ dimColor: true, wrap: 'truncate-start', children: [dir.replace(/\/$/, '')] })]),
               ],
             }),
             ...(isConfirming
@@ -1557,6 +1795,20 @@ function drawDesktop($, e, ui) {
     })
   }
 
+  // Folder tree: one dim line per folder, its files indented under it
+  const fileRows = (list, isStagedList) => {
+    if (!cfg.fileTree) return list.map((f) => fileRow(f, isStagedList))
+    const groups = new Map()
+    for (const f of list) {
+      const dir = splitPath(f.path.replace(/\/$/, ''))[0].replace(/\/$/, '')
+      if (!groups.has(dir)) groups.set(dir, [])
+      groups.get(dir).push(f)
+    }
+    return [...groups].flatMap(([dir, fs]) => [
+      Text({ key: 'dir-' + (isStagedList ? 's-' : 'u-') + dir, dimColor: true, wrap: 'truncate-start', children: ['📁 ' + (dir || '(root)')] }),
+      ...fs.map((f) => Box({ key: 'ind-' + (isStagedList ? 's-' : 'u-') + f.path, marginLeft: 2, flexDirection: 'column', children: [fileRow(f, isStagedList, true)] })),
+    ])
+  }
   const section = (title, list, isStagedList) =>
     Box({
       flexDirection: 'column',
@@ -1573,7 +1825,11 @@ function drawDesktop($, e, ui) {
             Box({
               flexDirection: 'row',
               gap: 'sm',
-              children: [Text({ weight: 'semibold', color: isStagedList ? 'success' : 'warning', children: [title] }), Text({ dimColor: true, children: ['(' + list.length + ')'] })],
+              children: [
+                Button({ key: 'fold-' + title, label: folded.has(title) ? '▸' : '▾', plain: true, dimColor: true, onPress: () => { folded.has(title) ? folded.delete(title) : folded.add(title); redraw() } }),
+                Text({ weight: 'semibold', color: isStagedList ? 'success' : 'warning', children: [title] }),
+                Text({ dimColor: true, children: ['(' + list.length + ')'] }),
+              ],
             }),
             list.length
               ? isStagedList
@@ -1582,7 +1838,7 @@ function drawDesktop($, e, ui) {
               : Text({ children: [''] }),
           ],
         }),
-        ...(list.length ? list.map((f) => fileRow(f, isStagedList)) : [Text({ dimColor: true, children: [isStagedList ? 'Nothing staged' : 'No unstaged changes'] })]),
+        ...(folded.has(title) ? [] : list.length ? fileRows(list, isStagedList) : [Text({ dimColor: true, children: [isStagedList ? 'Nothing staged' : 'No unstaged changes'] })]),
       ],
     })
 
@@ -1602,20 +1858,27 @@ function drawDesktop($, e, ui) {
           Input({
             key: 'commit-subject',
             label: 'Summary ',
-            rows: 3,
+            rows: cfg.summaryRows,
             value: dmsg.subject,
             placeholder: 'Short imperative summary',
-            onInput: (v) => { dmsg.subject = v },
+            onInput: (v) => {
+              const was = lenBand(dmsg.subject.length)
+              dmsg.subject = v
+              if (cfg.summaryCounter && lenBand(v.length) !== was) redraw() // the counter changes color only when the band does
+            },
             onSubmit: (v) => {
               dmsg.subject = v
               if (!staged.length) return setNotice($, 'info', 'Nothing is staged. Stage the files to commit.')
               return runAction($, 'Committing', () => commitFromDesktop($))
             },
           }),
+          ...(cfg.summaryCounter && dmsg.subject
+            ? [Text({ color: ['', 'success', 'warning', 'error'][lenBand(dmsg.subject.length)] || undefined, dimColor: lenBand(dmsg.subject.length) === 1, children: [['', 'Good length', 'Long: past 50 characters', 'Too long: past 72 characters'][lenBand(dmsg.subject.length)]] })]
+            : []),
           Input({
             key: 'commit-body',
             label: 'Body    ',
-            rows: 10,
+            rows: cfg.bodyRows,
             value: dmsg.body,
             placeholder: 'Optional · a newline is typed as in the prompt box',
             onInput: (v) => { dmsg.body = v },
@@ -1657,9 +1920,21 @@ function drawDesktop($, e, ui) {
   const historyTab = () => {
     if (history.error) return [Text({ color: 'error', wrap: 'wrap', children: [history.error] })]
     if (!history.commits.length) return [Text({ dimColor: true, children: [history.loading || history.key !== historyKey() ? 'Reading history…' : 'No commits yet'] })]
+    const searchBar = Box({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 'sm',
+      children: [
+        Box({ flexGrow: 1, flexShrink: 1, children: [Input({ key: 'history-query', label: '🔍', value: histQuery, placeholder: 'Search subject, author, hash or ref', onInput: (v) => { histQuery = v; redraw() }, onSubmit: (v) => { histQuery = v; redraw() } })] }),
+        Button({ key: 'history-scope', label: histScope === 'all' ? '⑂ All branches' : '↳ This branch', onPress: () => { histScope = histScope === 'all' ? 'head' : 'all'; history.key = ''; loadHistory($).catch(() => {}); redraw() } }),
+      ],
+    })
     const graphCells = Math.ceil((GRAPH_PAD * 2 + (Math.min(history.lanes, MAX_LANES) - 1) * LANE_W) / 8)
     const refColor = { head: 'suggestion', local: 'success', remote: 'merged', tag: 'warning', detached: 'suggestion' }
+    const q = histQuery.trim().toLowerCase()
+    const hit = (c) => !q || (c.subject + ' ' + c.author + ' ' + c.hash + ' ' + c.refs.map((r) => r.name).join(' ')).toLowerCase().includes(q)
     const rows = history.commits.map((c, i) => {
+      if (!hit(c)) return null
       const isSel = commitSel?.hash === c.hash
       // One short chip per row (head and local first): a row with many refs would wrap. All refs show in the commit detail.
       const rank = { head: 0, detached: 0, local: 1, tag: 2, remote: 3 }
@@ -1675,7 +1950,7 @@ function drawDesktop($, e, ui) {
         gap: 'sm',
         ...(isSel ? { backgroundColor: '#4C8DF622' } : {}),
         children: [
-          Svg({ source: graphSvg(history.rows[i], history.lanes, c.hash === repo.oid), alt: 'Graph lane for ' + c.short, width: GRAPH_PAD * 2 + (Math.min(history.lanes, MAX_LANES) - 1) * LANE_W, height: ROW_H }),
+          ...(q ? [] : [Svg({ source: graphSvg(history.rows[i], history.lanes, c.hash === repo.oid), alt: 'Graph lane for ' + c.short, width: GRAPH_PAD * 2 + (Math.min(history.lanes, MAX_LANES) - 1) * LANE_W, height: ROW_H })]),
           ...chips.map((r) => Text({ color: 'inverseText', backgroundColor: refColor[r.kind] ?? 'subtle', wrap: 'truncate-end', children: [' ' + r.name + ' '] })),
           ...(extra > 0 ? [Text({ dimColor: true, children: ['+' + extra] })] : []),
           Box({
@@ -1726,11 +2001,14 @@ function drawDesktop($, e, ui) {
         children: [line, Box({ flexDirection: 'column', gap: 'xs', borderStyle: 'round', borderColor: 'subtle', paddingX: 'sm', marginLeft: 2, children: detail })],
       })
     })
+    const found = rows.filter(Boolean)
+    if (q && !found.length) return [searchBar, Text({ dimColor: true, children: ['No loaded commit matches "' + histQuery.trim() + '". Load more commits to search further back.'] })]
+    rows.splice(0, rows.length, ...found)
     if (history.commits.length >= history.limit) {
-      rows.push(Button({ key: 'history-more', label: 'Load ' + HISTORY_STEP + ' more', plain: true, dimColor: true, onPress: () => { history.limit += HISTORY_STEP; history.key = ''; loadHistory($).catch(() => {}) } }))
+      rows.push(Button({ key: 'history-more', label: 'Load ' + cfg.historyPageSize + ' more', plain: true, dimColor: true, onPress: () => { history.limit += cfg.historyPageSize; history.key = ''; loadHistory($).catch(() => {}) } }))
     }
     // No gap between rows: the graph lines then meet from one row to the next
-    return [Box({ flexDirection: 'column', children: rows })]
+    return [searchBar, Box({ flexDirection: 'column', children: rows })]
   }
 
   // --- Stashes tab ---
@@ -1808,6 +2086,9 @@ function drawDesktop($, e, ui) {
   return Box({ flexDirection: 'column', gap: 'sm', children: out })
 }
 
+// Band of a summary's length: 0 empty, 1 up to 50, 2 up to 72, 3 over
+export const lenBand = (n) => (n === 0 ? 0 : n <= 50 ? 1 : n <= 72 ? 2 : 3)
+
 function closePane($) {
   paneOpen = false
   return $.ui.close({ id: PANE })
@@ -1825,17 +2106,27 @@ export function register(on) {
     } catch (err) {
       $.ui.log('git-mod: could not register /git-close: ' + err.message, { to: 'debug' })
     }
-    $.clock.every(POLL_MS, () => {
-      if (paneOpen && !busy) refresh($).catch(() => {})
-    })
+    await loadCfg($)
+    view = { tab: cfg.defaultTab === 1 ? 'history' : 'changes' }
+    history.limit = cfg.historyPageSize
+    try {
+      await $.command.register({ name: 'git-settings', description: 'Open the git panel settings', immediate: true })
+    } catch (err) {
+      $.ui.log('git-mod: could not register /git-settings: ' + err.message, { to: 'debug' })
+    }
+    startPoll($)
     // Always on: open the panel by itself when the session is in a git repo.
     // A pane the mod opens waits for a wide enough terminal (144+ columns).
     try {
       await refresh($)
-      if (repo && !repo.error) {
+      try {
+        Object.assign(drafts, await read($, draftsAtom))
+        dmsg = drafts[currentRoot()] ?? dmsg
+      } catch {}
+      if (repo && !repo.error && cfg.autoOpenPane) {
         paneOpen = true
         loadBranches($).catch(() => {}) // ready before the first search
-        await $.ui.open({ id: PANE, title: 'Git', columns: await paneColumns($) })
+        await $.ui.open({ id: PANE, title: '📂 Git', columns: await paneColumns($) })
       }
     } catch (err) {
       $.ui.log('git-mod: could not open the panel: ' + (err?.message ?? err), { to: 'debug' })
@@ -1848,8 +2139,18 @@ export function register(on) {
     lastSig = ''
     await refresh($)
     if (!branches.length) loadBranches($).catch(() => {})
-    await $.ui.open({ id: PANE, title: 'Git', focus: true, closeOnEscape: true, columns: await paneColumns($) })
+    await $.ui.open({ id: PANE, title: '📂 Git', focus: true, closeOnEscape: true, columns: await paneColumns($) })
     return {}
+  })
+
+  on('command.run', { command: 'git-settings' }, async ($) => {
+    await $.ui.open({ id: SETTINGS_PANE, title: '⚙ Git settings', focus: true, closeOnEscape: true })
+    return {}
+  })
+
+  on('ui.render', { component: 'Pane' }, async ($, e, next) => {
+    if (e.requestId !== SETTINGS_PANE) return next(e)
+    return drawSettings($, e)
   })
 
   on('command.run', { command: 'git-close' }, async ($) => {
