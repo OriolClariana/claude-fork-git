@@ -116,4 +116,4 @@ Oriol Marc Clariana Justes, on top of the work of Michael Dobekidis.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). You can use, change and share it for free. Keep the copyright notices in `LICENSE`, and if you build on this project or share it, please credit it with a link to [OriolClariana/claude-fork-git-pane](https://github.com/OriolClariana/claude-fork-git-pane). Do not present it as your own work.
