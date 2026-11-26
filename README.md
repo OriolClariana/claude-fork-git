@@ -1,4 +1,4 @@
-# claude-fork-git-pane
+# claude-fork-git
 
 A Fork-style git panel for Claude Code Desktop: changes, commit graph, submodules, stashes and AI commit messages, without leaving the app. The terminal keeps the original text view.
 
@@ -65,7 +65,7 @@ Open them with `/git-settings` or the ⚙ button in the toolbar. Every change ap
 ## Install
 
 ```
-/plugin marketplace add OriolClariana/claude-fork-git-pane
+/plugin marketplace add OriolClariana/claude-fork-git
 /plugin install fork-git-pane@fork-git-pane-mod
 ```
 
@@ -74,7 +74,7 @@ If your organization blocks marketplaces, clone the repo and add this to `~/.cla
 ```json
 {
   "env": {
-    "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-fork-git-pane",
+    "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-fork-git",
     "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1"
   }
 }
@@ -116,4 +116,4 @@ Oriol Marc Clariana Justes, on top of the work of Michael Dobekidis.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). You can use, change and share it for free. Keep the copyright notices in `LICENSE`, and if you build on this project or share it, please credit it with a link to [OriolClariana/claude-fork-git-pane](https://github.com/OriolClariana/claude-fork-git-pane). Do not present it as your own work.
+MIT, see [LICENSE](LICENSE). You can use, change and share it for free. Keep the copyright notices in `LICENSE`, and if you build on this project or share it, please credit it with a link to [OriolClariana/claude-fork-git](https://github.com/OriolClariana/claude-fork-git). Do not present it as your own work.

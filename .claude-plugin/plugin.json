@@ -6,7 +6,7 @@
     "name": "OriolClariana"
   },
   "license": "MIT",
-  "repository": "https://github.com/OriolClariana/claude-fork-git-pane",
+  "repository": "https://github.com/OriolClariana/claude-fork-git",
   "types": "./types/index.d.ts",
   "keywords": [
     "git",
