@@ -436,6 +436,12 @@ function drawSettings($, e) {
 }
 
 // Runs one action at a time; shows a working line while it runs
+// Change the label shown next to the spinning orb while a long action moves to its next phase
+function step($, label) {
+  busy = label
+  $.ui.invalidate('ui.render')
+}
+
 async function runAction($, label, work) {
   if (busy) {
     $.ui.toast('git-mod is busy: ' + busy)
@@ -594,11 +600,14 @@ async function push($) {
     args = ['push', '-u', remote, repo.branch]
     target = remote + '/' + repo.branch
   }
+  step($, 'Pushing ' + repo.branch + ' → ' + target)
   let r = await gitRoot($, args, { timeoutMs: 180000 })
   // The server rejects the push when LFS objects are missing (the lfs pre-push hook did not run): upload them and retry once.
   // Only on that error, because `lfs push --all` scans the whole history and is slow on big repos.
   if (!r.ok && /git lfs push/i.test(r.err || r.out)) {
+    step($, 'Uploading LFS objects (can take several minutes)')
     const lfs = await gitRoot($, ['lfs', 'push', '--all', target.split('/')[0], repo.branch], { timeoutMs: 600000 })
+    step($, 'Pushing ' + repo.branch + ' again')
     r = lfs.ok ? await gitRoot($, args, { timeoutMs: 180000 }) : lfs
   }
   if (!r.ok) {
