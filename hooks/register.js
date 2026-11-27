@@ -54,7 +54,8 @@ const KIND = {
 
 // Module state: rebuilt by the next refresh after a hot reload
 let paneOpen = false
-let refreshing = false
+let refreshing = null // promise of the refresh in flight, null when idle
+const parentCache = {} // detected base branch per repository path and branch, so re-entering a submodule is instant
 let loaded = false
 let repo = null // { error } | { root, branch, oid, upstream, ahead, behind, isDetached, isUnborn }
 let files = [] // { path, orig, x, y, isUntracked, isConflict }
@@ -231,10 +232,21 @@ async function detectParent($, branch) {
   return best
 }
 
-async function refresh($) {
-  if (refreshing) return
-  refreshing = true
+// `wait`: queue behind a refresh already running instead of dropping this call (used after navigating)
+async function refresh($, wait) {
+  if (refreshing) {
+    if (!wait) return
+    await refreshing
+  }
+  refreshing = refreshNow($)
   try {
+    await refreshing
+  } finally {
+    refreshing = null
+  }
+}
+
+async function refreshNow($) {
     let top = await git($, ['rev-parse', '--show-toplevel'], navStack.length ? { cwd: navStack[navStack.length - 1] } : {})
     if (!top.ok && navStack.length) {
       // The submodule folder is gone or no longer a repository: back to the top
@@ -249,7 +261,11 @@ async function refresh($) {
     } else {
       const root = top.out.trim()
       if (!navStack.length) topRoot = root
-      const st = await git($, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=normal'], { cwd: root })
+      const [st, sm, sl] = await Promise.all([
+        git($, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=normal'], { cwd: root }),
+        git($, ['submodule', 'status'], { cwd: root }),
+        git($, ['stash', 'list', '--format=%gd%x1f%h%x1f%gs%x1f%cr%x1e'], { cwd: root }),
+      ])
       const { info, list } = parseStatus(st.out)
       repo = {
         root,
@@ -262,17 +278,16 @@ async function refresh($) {
         isUnborn: info.oid === '(initial)',
       }
       files = list
-      const sm = await git($, ['submodule', 'status'], { cwd: root })
       subs = sm.ok ? parseSubmodules(sm.out) : []
       // The open diff goes when its file leaves the lists (committed, discarded)
       if (diffSel && !(diffSel.isStaged ? stagedFiles() : unstagedFiles()).some((f) => f.path === diffSel.path)) diffSel = null
-      const sl = await git($, ['stash', 'list', '--format=%gd%x1f%h%x1f%gs%x1f%cr%x1e'], { cwd: root })
       stashes = sl.ok ? parseStashes(sl.out) : []
 
       const b = repo.branch
       if (parentOf.branch !== b) {
-        const parent = b.includes('/') && !repo.isDetached && !repo.isUnborn ? await detectParent($, b) : ''
-        parentOf = { branch: b, parent }
+        const key = root + '|' + b
+        if (!(key in parentCache)) parentCache[key] = b.includes('/') && !repo.isDetached && !repo.isUnborn ? await detectParent($, b) : ''
+        parentOf = { branch: b, parent: parentCache[key] }
       }
     }
     loaded = true
@@ -284,9 +299,6 @@ async function refresh($) {
     // Desktop view: keep the open diff and the history in step with the repo
     if (diffSel) await fetchSelDiff($)
     if (view.tab === 'history' && history.key !== historyKey()) loadHistory($).catch(() => {})
-  } finally {
-    refreshing = false
-  }
 }
 
 function setNotice($, tone, text, hash) {
@@ -1363,8 +1375,15 @@ async function navigate($, stack) {
   navStack = stack
   resetRepoView()
   dmsg = drafts[currentRoot()] ?? dmsg
-  await refresh($)
-  $.ui.invalidate('ui.render')
+  // Show at once that something is happening, unless another action already owns the label
+  const own = !busy
+  if (own) step($, 'Opening ' + (currentRoot().split('/').pop() || 'repository') + '…')
+  try {
+    await refresh($, true)
+  } finally {
+    if (own) busy = ''
+    $.ui.invalidate('ui.render')
+  }
 }
 
 function historyKey() {
