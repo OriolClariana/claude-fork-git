@@ -594,10 +594,13 @@ async function push($) {
     args = ['push', '-u', remote, repo.branch]
     target = remote + '/' + repo.branch
   }
-  // Upload LFS objects first: the lfs pre-push hook is missing in some clones and the server then rejects the push.
-  // Its failure is ignored (git-lfs not installed, or nothing to upload): the push below reports any real error.
-  await gitRoot($, ['lfs', 'push', '--all', target.split('/')[0], repo.branch], { timeoutMs: 600000 })
-  const r = await gitRoot($, args, { timeoutMs: 180000 })
+  let r = await gitRoot($, args, { timeoutMs: 180000 })
+  // The server rejects the push when LFS objects are missing (the lfs pre-push hook did not run): upload them and retry once.
+  // Only on that error, because `lfs push --all` scans the whole history and is slow on big repos.
+  if (!r.ok && /git lfs push/i.test(r.err || r.out)) {
+    const lfs = await gitRoot($, ['lfs', 'push', '--all', target.split('/')[0], repo.branch], { timeoutMs: 600000 })
+    r = lfs.ok ? await gitRoot($, args, { timeoutMs: 180000 }) : lfs
+  }
   if (!r.ok) {
     setNotice($, 'error', 'Push failed:\n' + lastLines(r.err || r.out, 6))
     return
