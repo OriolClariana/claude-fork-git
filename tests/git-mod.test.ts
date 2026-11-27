@@ -330,18 +330,24 @@ test('Push without upstream sets it on origin', async ($, on) => {
   expect(calls.some((c) => c.slice(5).join(' ') === 'push -u origin fix/crash')).toBe(true)
 })
 
-test('Push uploads LFS objects first, even if that step fails', async ($, on) => {
+test('Push uploads missing LFS objects only when the server asks, then retries', async ($, on) => {
   const calls: string[][] = []
+  let pushes = 0
   baseStubs(on, calls, {
-    status: () => ({ value: { exitCode: 0, stdout: '# branch.oid 1\0# branch.head fix/crash\0# branch.upstream origin/fix/crash\0', stderr: '' } }),
-    lfs: () => ({ value: { exitCode: 1, stdout: '', stderr: 'git: lfs is not a git command' } }),
+    status: () => ({ value: { exitCode: 0, stdout: '# branch.oid 1\0# branch.head fix/crash\0', stderr: '' } }),
+    remote: () => ({ value: { exitCode: 0, stdout: 'origin\n', stderr: '' } }),
+    push: () => ({ value: pushes++ === 0
+      ? { exitCode: 1, stdout: '', stderr: "remote: Try to push them with 'git lfs push --all'.\nremote: pre-receive hook declined" }
+      : { exitCode: 0, stdout: '', stderr: '' } }),
   })
   await $.command.run({ command: 'git', args: '' })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' } as any)
   await ui.press({ key: 'push' })
+  await new Promise((r) => setTimeout(r, 100))
   const cmds = calls.map((c) => c.slice(5).join(' '))
   expect(cmds.indexOf('lfs push --all origin fix/crash')).toBeGreaterThan(-1)
-  expect(cmds.indexOf('push')).toBeGreaterThan(cmds.indexOf('lfs push --all origin fix/crash'))
+  expect(pushes).toBe(2)
+  expect(cmds.lastIndexOf('push -u origin fix/crash')).toBeGreaterThan(cmds.indexOf('lfs push --all origin fix/crash'))
 })
 
 test('Pull fast-forwards from the upstream', async ($, on) => {
